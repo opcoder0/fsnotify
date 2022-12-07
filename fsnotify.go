@@ -59,6 +59,18 @@ const (
 	// get triggered very frequently by some software. For example, Spotlight
 	// indexing on macOS, anti-virus software, backup software, etc.
 	Chmod
+
+	// File was opened / read.
+	// Supported only with FanotifyWatcher
+	Access
+
+	// File was closed.
+	// Supported only with FanotifyWatcher
+	Close
+
+	// File was opened with intent to execute.
+	// Supported only with FanotifyWatcher
+	Execute
 )
 
 // Common errors that can be reported.
