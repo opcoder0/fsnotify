@@ -235,7 +235,6 @@ func newFanotifyWatcher(mountpointPath string, flags, eventFlags uint) (*Fanotif
 		mountpoint:         mountpoint,
 		kernelMajorVersion: maj,
 		kernelMinorVersion: min,
-		watches:            make(map[string]bool),
 		stopper: struct {
 			r *os.File
 			w *os.File
@@ -255,18 +254,6 @@ func (w *FanotifyWatcher) fanotifyMark(path string, flags uint, mask uint64, rem
 	}
 	if err := fanotifyMarkMaskValid(mask); err != nil {
 		return fmt.Errorf("%v: %w", err, ErrInvalidFlagCombination)
-	}
-	_, found := w.watches[path]
-	if found {
-		if remove {
-			delete(w.watches, path)
-			skip = false
-		}
-	} else {
-		if !remove {
-			w.watches[path] = true
-			skip = false
-		}
 	}
 	if !skip {
 		if err := unix.FanotifyMark(w.fd, flags, mask, -1, path); err != nil {
@@ -458,7 +445,7 @@ func (a fanotifyAction) toOp() Op {
 	if a.Has(unix.FAN_OPEN_EXEC) {
 		op |= Execute
 	}
-	if a.Has(unix.FAN_ACCESS) {
+	if a.Has(unix.FAN_ACCESS) || a.Has(unix.FAN_OPEN) {
 		op |= Access
 	}
 	return op

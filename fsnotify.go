@@ -97,6 +97,15 @@ func (o Op) String() string {
 	if o.Has(Chmod) {
 		b.WriteString("|CHMOD")
 	}
+	if o.Has(Access) {
+		b.WriteString("|ACCESS")
+	}
+	if o.Has(Close) {
+		b.WriteString("|CLOSE")
+	}
+	if o.Has(Execute) {
+		b.WriteString("|EXECUTE")
+	}
 	if b.Len() == 0 {
 		return "[no events]"
 	}

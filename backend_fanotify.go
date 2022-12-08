@@ -68,7 +68,6 @@ type FanotifyWatcher struct {
 	mountpoint         *os.File
 	kernelMajorVersion int
 	kernelMinorVersion int
-	watches            map[string]bool
 	stopper            struct {
 		r *os.File
 		w *os.File
@@ -158,13 +157,16 @@ func (w *FanotifyWatcher) Close() {
 // Add watches the specified directory for specified actions
 func (w *FanotifyWatcher) Add(name string) error {
 	var action fanotifyAction
-	// all actions except FAN_ACCESS
-	action = fanotifyAction(unix.FAN_CREATE | unix.FAN_DELETE |
-		unix.FAN_MODIFY | unix.FAN_MOVE_SELF |
-		unix.FAN_MOVED_FROM | unix.FAN_MOVED_TO |
-		unix.FAN_DELETE_SELF | unix.FAN_ATTRIB |
-		unix.FAN_CLOSE_WRITE | unix.FAN_CLOSE_NOWRITE |
-		unix.FAN_OPEN_EXEC)
+	action = fanotifyAction(unix.FAN_ACCESS | unix.FAN_MODIFY |
+		unix.FAN_OPEN |
+		unix.FAN_OPEN_EXEC |
+		unix.FAN_ATTRIB |
+		unix.FAN_CREATE |
+		unix.FAN_DELETE |
+		unix.FAN_DELETE_SELF |
+		unix.FAN_MOVED_FROM |
+		unix.FAN_MOVED_TO |
+		unix.FAN_MOVE_SELF)
 	return w.fanotifyMark(name, unix.FAN_MARK_ADD, uint64(action|unix.FAN_EVENT_ON_CHILD), false)
 }
 
@@ -188,6 +190,5 @@ func (w *FanotifyWatcher) Remove() error {
 	if err := unix.FanotifyMark(w.fd, unix.FAN_MARK_FLUSH, 0, -1, ""); err != nil {
 		return err
 	}
-	w.watches = make(map[string]bool)
 	return nil
 }
