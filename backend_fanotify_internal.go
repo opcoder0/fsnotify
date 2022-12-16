@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"unsafe"
@@ -198,11 +199,64 @@ func fanotifyEventOK(meta *unix.FanotifyEventMetadata, n int) bool {
 		int(meta.Event_len) <= n)
 }
 
-func newFanotifyWatcher(mountpointPath string, flags, eventFlags uint) (*FanotifyWatcher, error) {
+func isFanotifyMarkMaskValid(flags uint, mask uint64) error {
+	isSet := func(n, k uint64) bool {
+		return n&k == k
+	}
+	if isSet(uint64(flags), unix.FAN_MARK_MOUNT) {
+		if isSet(mask, unix.FAN_CREATE) ||
+			isSet(mask, unix.FAN_ATTRIB) ||
+			isSet(mask, unix.FAN_MOVE) ||
+			isSet(mask, unix.FAN_DELETE_SELF) ||
+			isSet(mask, unix.FAN_DELETE) {
+			return errors.New("mountpoint cannot be watched for create, attrib, move or delete self event types")
+		}
+	}
+	return nil
+}
+
+// permissionType is ignored when isNotificationListener is true.
+func newFanotifyWatcher(mountpointPath string, entireMount bool, notificationOnly bool, permissionType PermissionType) (*FanotifyWatcher, error) {
+
+	var flags, eventFlags uint
+
 	maj, min, _, err := kernelVersion()
 	if err != nil {
 		return nil, err
 	}
+	if !notificationOnly {
+		// permission + notification events; cannot have FID with this.
+		switch permissionType {
+		case PreContent:
+			flags = unix.FAN_CLASS_PRE_CONTENT | unix.FAN_CLOEXEC
+		case PostContent:
+			flags = unix.FAN_CLASS_CONTENT | unix.FAN_CLOEXEC
+		default:
+			return nil, os.ErrInvalid
+		}
+	} else {
+		switch {
+		case maj < 5:
+			flags = unix.FAN_CLASS_NOTIF | unix.FAN_CLOEXEC
+		case maj == 5:
+			if min < 1 {
+				flags = unix.FAN_CLASS_NOTIF | unix.FAN_CLOEXEC
+			}
+			if min >= 1 && min < 9 {
+				flags = unix.FAN_CLASS_NOTIF | unix.FAN_CLOEXEC | unix.FAN_REPORT_FID
+			}
+			if min >= 9 {
+				flags = unix.FAN_CLASS_NOTIF | unix.FAN_CLOEXEC | unix.FAN_REPORT_DIR_FID | unix.FAN_REPORT_NAME
+			}
+		case maj > 5:
+			flags = unix.FAN_CLASS_NOTIF | unix.FAN_CLOEXEC | unix.FAN_REPORT_DIR_FID | unix.FAN_REPORT_NAME
+		}
+		// FAN_MARK_MOUNT cannot be specified with FAN_REPORT_FID, FAN_REPORT_DIR_FID, FAN_REPORT_NAME
+		if entireMount {
+			flags = unix.FAN_CLASS_NOTIF | unix.FAN_CLOEXEC
+		}
+	}
+	eventFlags = unix.O_RDONLY | unix.O_LARGEFILE | unix.O_CLOEXEC
 	if err := flagsValid(flags); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidFlagCombination, err)
 	}
@@ -215,7 +269,7 @@ func newFanotifyWatcher(mountpointPath string, flags, eventFlags uint) (*Fanotif
 	}
 	mountpoint, err := os.Open(mountpointPath)
 	if err != nil {
-		return nil, fmt.Errorf("error opening mountpoint %s: %w", mountpointPath, err)
+		return nil, fmt.Errorf("error opening mount point %s: %w", mountpointPath, err)
 	}
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -229,30 +283,33 @@ func newFanotifyWatcher(mountpointPath string, flags, eventFlags uint) (*Fanotif
 	if err != nil {
 		return nil, fmt.Errorf("stopper error: cannot set fd to non-blocking: %v", err)
 	}
-	fanotifyWatcher := &FanotifyWatcher{
+	watcher := &FanotifyWatcher{
 		fd:                 fd,
 		flags:              flags,
 		mountpoint:         mountpoint,
 		kernelMajorVersion: maj,
 		kernelMinorVersion: min,
+		entireMount:        entireMount,
+		notificationOnly:   notificationOnly,
 		stopper: struct {
 			r *os.File
 			w *os.File
 		}{r, w},
-		Events: make(chan FanotifyEvent),
+		Events:           make(chan FanotifyEvent),
+		PermissionEvents: make(chan FanotifyEvent),
 	}
-	return fanotifyWatcher, nil
+	return watcher, nil
 }
 
-func (w *FanotifyWatcher) fanotifyMark(path string, flags uint, mask uint64, remove bool) error {
-	skip := true
+func (w *FanotifyWatcher) fanotifyMark(path string, flags uint, mask uint64) error {
 	if w == nil {
-		return ErrNilWatcher
+		panic("nil listener")
 	}
+	skip := true
 	if !fanotifyMarkFlagsKernelSupport(mask, w.kernelMajorVersion, w.kernelMinorVersion) {
 		panic("some of the mark mask combinations specified are not supported on the current kernel; refer to the documentation")
 	}
-	if err := fanotifyMarkMaskValid(mask); err != nil {
+	if err := isFanotifyMarkMaskValid(flags, mask); err != nil {
 		return fmt.Errorf("%v: %w", err, ErrInvalidFlagCombination)
 	}
 	if !skip {
@@ -334,7 +391,7 @@ func (w *FanotifyWatcher) readEvents() error {
 				panic("metadata structure from the kernel does not match the structure definition at compile time")
 			}
 			if metadata.Fd != unix.FAN_NOFD {
-				// no fid
+				// no fid (applicable to kernels 5.0 and earlier)
 				procFdPath := fmt.Sprintf("/proc/self/fd/%d", metadata.Fd)
 				n1, err := unix.Readlink(procFdPath, name[:])
 				if err != nil {
@@ -355,10 +412,18 @@ func (w *FanotifyWatcher) readEvents() error {
 					Fd:  int(metadata.Fd),
 					Pid: int(metadata.Pid),
 				}
-				w.Events <- event
-
+				if mask&unix.FAN_ACCESS_PERM == unix.FAN_ACCESS_PERM ||
+					mask&unix.FAN_OPEN_PERM == unix.FAN_OPEN_PERM ||
+					mask&unix.FAN_OPEN_EXEC_PERM == unix.FAN_OPEN_EXEC_PERM {
+					w.PermissionEvents <- event
+				} else {
+					w.Events <- event
+				}
+				i += int(metadata.Event_len)
+				n -= int(metadata.Event_len)
+				metadata = (*unix.FanotifyEventMetadata)(unsafe.Pointer(&buf[i]))
 			} else {
-				// fid
+				// fid (applicable to kernels 5.1+)
 				fid = (*fanotifyEventInfoFID)(unsafe.Pointer(&buf[i+int(metadata.Metadata_len)]))
 				withName := false
 				switch {
@@ -396,12 +461,14 @@ func (w *FanotifyWatcher) readEvents() error {
 				}
 				event := FanotifyEvent{
 					Event: Event{
-						Name: fmt.Sprintf("%s/%s", pathName, fileName),
+						Name: filepath.Join(pathName, fileName),
 						Op:   fanotifyAction(mask).toOp(),
 					},
 					Fd:  fd,
 					Pid: int(metadata.Pid),
 				}
+				// As of the kernel release (6.0) permission events cannot have FID flags.
+				// So the event here is always a notification event
 				w.Events <- event
 				i += int(metadata.Event_len)
 				n -= int(metadata.Event_len)
@@ -447,6 +514,15 @@ func (a fanotifyAction) toOp() Op {
 	}
 	if a.Has(unix.FAN_ACCESS) || a.Has(unix.FAN_OPEN) {
 		op |= Access
+	}
+	if a.Has(unix.FAN_OPEN_PERM) {
+		op |= PermissionToOpen
+	}
+	if a.Has(unix.FAN_OPEN_EXEC_PERM) {
+		op |= PermissionToExecute
+	}
+	if a.Has(unix.FAN_ACCESS_PERM) {
+		op |= PermissionToAccess
 	}
 	return op
 }

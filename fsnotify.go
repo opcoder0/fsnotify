@@ -71,6 +71,15 @@ const (
 	// File was opened with intent to execute.
 	// Supported only with FanotifyWatcher
 	Execute
+
+	// Permission to open a file
+	PermissionToOpen
+
+	// Permission to execute
+	PermissionToExecute
+
+	// Permission to read
+	PermissionToAccess
 )
 
 // Common errors that can be reported.

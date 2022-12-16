@@ -4,6 +4,8 @@
 package fsnotify
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"os"
 
@@ -14,15 +16,35 @@ var (
 	// ErrCapSysAdmin indicates caller is missing CAP_SYS_ADMIN permissions
 	ErrCapSysAdmin = errors.New("require CAP_SYS_ADMIN capability")
 	// ErrInvalidFlagCombination indicates the bit/combination of flags are invalid
-	ErrInvalidFlagCombination = errors.New("invalid flag bits")
-	// ErrNilWatcher indicates the watcher is nil
-	ErrNilWatcher = errors.New("nil watcher")
+	ErrInvalidFlagCombination = errors.New("invalid flag bitmask")
 	// ErrUnsupportedOnKernelVersion indicates the feature/flag is unavailable for the current kernel version
 	ErrUnsupportedOnKernelVersion = errors.New("feature unsupported on current kernel version")
+	// ErrWatchPath indicates path needs to be specified for watching
+	ErrWatchPath = errors.New("missing watch path")
 )
 
-// FanotifyEvent represents a notification from the kernel for the file, directory
-// or a filesystem marked for watching.
+// PermissionType represents value indicating when the permission event must be requested.
+type PermissionType int
+
+const (
+	// PermissionNone is used to indicate the listener is for notification events only.
+	PermissionNone PermissionType = 0
+	// PreContent is intended for event listeners that
+	// need to access files before they contain their final data.
+	PreContent PermissionType = 1
+	// PostContent is intended for event listeners that
+	// need to access files when they already contain their final content.
+	PostContent PermissionType = 2
+)
+
+// FanotifyEvent represents a notification or a permission event from the kernel for the file,
+// directory marked for watching.
+// Notification events are merely informative and require
+// no action to be taken by the receiving application with the exception being that the
+// file descriptor provided within the event must be closed.
+// Permission events are requests to the receiving application to decide whether permission
+// for a file access shall be granted. For these events, the recipient must write a
+// response which decides whether access is granted or not.
 type FanotifyEvent struct {
 	Event
 	// Fd is the open file descriptor for the file/directory being watched
@@ -59,34 +81,62 @@ type FanotifyWatcher struct {
 	//                      and on kqueue when a file is truncated. On Windows
 	//                      it's never sent.
 	Events chan FanotifyEvent
+	// PermissionEvents holds permission request events for the watched file/directory.
+	PermissionEvents chan FanotifyEvent
 
 	// fd returned by fanotify_init
 	fd int
 	// flags passed to fanotify_init
-	flags uint
-	// mount fd is the file descriptor of the mountpoint
+	flags              uint
 	mountpoint         *os.File
 	kernelMajorVersion int
 	kernelMinorVersion int
+	entireMount        bool
+	notificationOnly   bool
 	stopper            struct {
 		r *os.File
 		w *os.File
 	}
 }
 
-// NewFanotifyWatcher returns a fanotify listener from which events
-// can be read. Each listener supports listening to events
-// under a single mount point.
-//
-// For cases where multiple mountpoints need to be monitored
+// NewFanotifyWatcher returns a fanotify listener from which filesystem
+// notification events can be read. Each listener
+// supports listening to events under a single mount point.
+// For cases where multiple mount points need to be monitored
 // multiple listener instances need to be used.
 //
-// `mountpointPath` can be any file/directory under the mount point being watched.
-// `maxEvents` defines the length of the buffered channel which holds the notifications. The minimum length is 4096.
-// `withName` setting this to true populates the file name under the watched parent.
+// Notification events are merely informative and require
+// no action to be taken by the receiving application with the
+// exception being that the file descriptor provided within the
+// event must be closed.
 //
-// NOTE that this call requires CAP_SYS_ADMIN privilege
-func NewFanotifyWatcher(mountpointPath string) (*FanotifyWatcher, error) {
+// Permission events are requests to the receiving application to
+// decide whether permission for a file access shall be granted.
+// For these events, the recipient must write a response which decides
+// whether access is granted or not.
+//
+// - mountPoint can be any file/directory under the mount point being
+//   watched.
+// - entireMount initializes the listener to monitor either the
+//   the entire mount point (when true) or allows adding files
+//   or directories to the listener's watch list (when false).
+// - permType initializes the listener either notification events
+//   or both notification and permission events.
+//   Passing [PreContent] value allows the receipt of events
+//   notifying that a file has been accessed and events for permission
+//   decisions if a file may be accessed. It is intended for event listeners
+//   that need to access files before they contain their final data. Passing
+//   [PostContent] is intended for event listeners that need to access
+//   files when they already contain their final content.
+//
+// The function returns a new instance of the listener. The fanotify flags
+// are set based on the running kernel version. [ErrCapSysAdmin] is returned
+// if the process does not have CAP_SYS_ADM capability.
+//
+//  - For Linux kernel version 5.0 and earlier no additional information about the underlying filesystem object is available.
+//  - For Linux kernel versions 5.1 till 5.8 (inclusive) additional information about the underlying filesystem object is correlated to an event.
+//  - For Linux kernel version 5.9 or later the modified file name is made available in the event.
+func NewFanotifyWatcher(mountPoint string, entireMount bool, permType PermissionType) (*FanotifyWatcher, error) {
 	capSysAdmin, err := checkCapSysAdmin()
 	if err != nil {
 		return nil, err
@@ -94,12 +144,16 @@ func NewFanotifyWatcher(mountpointPath string) (*FanotifyWatcher, error) {
 	if !capSysAdmin {
 		return nil, ErrCapSysAdmin
 	}
-	var flags, eventFlags uint
-	flags = unix.FAN_CLASS_NOTIF | unix.FAN_CLOEXEC | unix.FAN_REPORT_DIR_FID | unix.FAN_REPORT_NAME
-	eventFlags = unix.O_RDONLY | unix.O_LARGEFILE | unix.O_CLOEXEC
-	w, err := newFanotifyWatcher(mountpointPath, flags, eventFlags)
+	isNotificationListener := true
+	if permType == PreContent || permType == PostContent {
+		isNotificationListener = false
+	}
+	w, err := newFanotifyWatcher(mountPoint, entireMount, isNotificationListener, permType)
+	if err != nil {
+		return nil, err
+	}
 	go w.start()
-	return w, err
+	return w, nil
 }
 
 // start starts the listener and polls the fanotify event notification group for marked events.
@@ -151,13 +205,14 @@ func (w *FanotifyWatcher) Close() {
 	w.stopper.r.Close()
 	w.stopper.w.Close()
 	close(w.Events)
+	close(w.PermissionEvents)
 	unix.Close(w.fd)
 }
 
 // Add watches the specified directory for specified actions
-func (w *FanotifyWatcher) Add(name string) error {
-	var action fanotifyAction
-	action = fanotifyAction(unix.FAN_ACCESS | unix.FAN_MODIFY |
+func (w *FanotifyWatcher) Add(path string) error {
+	var actions fanotifyAction
+	actions = fanotifyAction(unix.FAN_ACCESS | unix.FAN_MODIFY |
 		unix.FAN_OPEN |
 		unix.FAN_OPEN_EXEC |
 		unix.FAN_ATTRIB |
@@ -167,28 +222,72 @@ func (w *FanotifyWatcher) Add(name string) error {
 		unix.FAN_MOVED_FROM |
 		unix.FAN_MOVED_TO |
 		unix.FAN_MOVE_SELF)
-	return w.fanotifyMark(name, unix.FAN_MARK_ADD, uint64(action|unix.FAN_EVENT_ON_CHILD), false)
+	return w.fanotifyMark(path, unix.FAN_MARK_ADD, uint64(actions|unix.FAN_EVENT_ON_CHILD))
+}
+
+// AddWithPermissions watches the specified directory for actions
+// and permission requests for permission to open file/directory,
+// permission to open file for execution and permission to read
+// file or directory.
+func (w *FanotifyWatcher) AddWithPermissions(path string) error {
+	var actions fanotifyAction
+	// all except FAN_ACCESS
+	actions = fanotifyAction(unix.FAN_MODIFY |
+		unix.FAN_OPEN |
+		unix.FAN_OPEN_EXEC |
+		unix.FAN_ATTRIB |
+		unix.FAN_CREATE |
+		unix.FAN_DELETE |
+		unix.FAN_DELETE_SELF |
+		unix.FAN_MOVED_FROM |
+		unix.FAN_MOVED_TO |
+		unix.FAN_MOVE_SELF |
+		unix.FAN_OPEN_PERM |
+		unix.FAN_OPEN_EXEC_PERM |
+		unix.FAN_ACCESS_PERM)
+	return w.fanotifyMark(path, unix.FAN_MARK_ADD, uint64(actions|unix.FAN_EVENT_ON_CHILD))
 }
 
 // AddMountPoint watches the entire mount point for specified actions
 func (w *FanotifyWatcher) AddMountPoint() error {
 	var action fanotifyAction
-	// all actions except FAN_ACCESS
-	action = fanotifyAction(unix.FAN_DELETE |
-		unix.FAN_MODIFY | unix.FAN_MOVE_SELF |
-		unix.FAN_MOVED_FROM | unix.FAN_MOVED_TO |
-		unix.FAN_DELETE_SELF | unix.FAN_ATTRIB |
-		unix.FAN_CLOSE_WRITE | unix.FAN_CLOSE_NOWRITE |
+	action = fanotifyAction(unix.FAN_ACCESS |
+		unix.FAN_MODIFY |
+		unix.FAN_CLOSE_WRITE |
+		unix.FAN_CLOSE_NOWRITE |
+		unix.FAN_OPEN |
 		unix.FAN_OPEN_EXEC)
-	return w.fanotifyMark(w.mountpoint.Name(), unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT, uint64(action), false)
+
+	return w.fanotifyMark(w.mountpoint.Name(), unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT, uint64(action))
 }
 
+// Remove removes / clears the current event mask
 func (w *FanotifyWatcher) Remove() error {
 	if w == nil {
-		return ErrNilWatcher
+		panic("nil watcher")
 	}
 	if err := unix.FanotifyMark(w.fd, unix.FAN_MARK_FLUSH, 0, -1, ""); err != nil {
 		return err
 	}
 	return nil
+}
+
+// Allow sends an "allowed" response to the permission request event.
+func (w *FanotifyWatcher) Allow(e FanotifyEvent) {
+	var response unix.FanotifyResponse
+	response.Fd = int32(e.Fd)
+	response.Response = unix.FAN_ALLOW
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, &response)
+	unix.Write(w.fd, buf.Bytes())
+}
+
+// Deny sends an "denied" response to the permission request event.
+func (w *FanotifyWatcher) Deny(e FanotifyEvent) {
+	var response unix.FanotifyResponse
+	response.Fd = int32(e.Fd)
+	response.Response = unix.FAN_DENY
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, &response)
+	unix.Write(w.fd, buf.Bytes())
 }
